@@ -1,0 +1,2 @@
+*.html !text !filter !merge !diff
+*.css !text !filter !merge !diff
