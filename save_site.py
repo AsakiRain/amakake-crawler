@@ -12,13 +12,17 @@ from urllib.parse import urlparse, urljoin, unquote
 
 # ================= 配置区 =================
 START_URL = "https://amakake-plant.jimdofree.com/"
-SAVE_DIR = "Amakake_Complete_Local"
+SAVE_DIR = "Amakake_Complete_Local" 
 ASSET_DIR_NAME = "assets"
 # =========================================
 
 ASSET_PATH = os.path.join(SAVE_DIR, ASSET_DIR_NAME)
 if not os.path.exists(ASSET_PATH):
     os.makedirs(ASSET_PATH)
+
+# 【新增】本次运行的内存缓存，避免同一次爬取中重复下载同一个公共资源(如logo)
+# 但重启脚本后，会清空并重新下载覆盖，确保安全性。
+SESSION_DOWNLOADED = set()
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
@@ -69,24 +73,19 @@ def process_css_text(session, css_text, base_url_list, tag_info="CSS"):
         clean_url = raw_content.strip('\'"').strip()
         if clean_url.startswith('data:') or not clean_url: return match.group(0)
         
-        indent = "      " 
-        if tag_info == "RecursiveCSS": indent = "        "
-        
-        # CSS 内部资源递归下载
-        _, filename = download_asset(session, clean_url, base_url_list, indent, parent_type="CSS")
+        # 递归下载
+        _, filename = download_asset(session, clean_url, base_url_list, parent_type="CSS")
         
         if filename:
             if tag_info == "Inline":
-                log(f"      ★ [内联修复] {clean_url} -> assets/{filename}")
+                log(f"★ [内联修复] {clean_url} -> assets/{filename}")
             return f'url("{filename}")'
         return match.group(0)
 
     import_pattern = re.compile(r'@import\s+[\'"](.*?)[\'"];', re.IGNORECASE)
     def import_replace(match):
         original = match.group(1).strip()
-        indent = "      "
-        if tag_info == "RecursiveCSS": indent = "        "
-        _, filename = download_asset(session, original, base_url_list, indent, parent_type="CSS")
+        _, filename = download_asset(session, original, base_url_list, parent_type="CSS")
         if filename:
             return f'@import "{filename}";'
         return match.group(0)
@@ -96,10 +95,10 @@ def process_css_text(session, css_text, base_url_list, tag_info="CSS"):
         modified = import_pattern.sub(import_replace, modified)
         return modified
     except Exception as e:
-        log(f"    CSS解析错误: {e}")
+        log(f"!! CSS解析错误: {e}")
         return css_text
 
-def download_asset(session, url, referer_list, indent="    ", parent_type="Asset"):
+def download_asset(session, url, referer_list, indent="", parent_type="Asset"):
     if not url or url.startswith('data:') or url.startswith('#'): return None, None
     
     base_ref = referer_list[0] if isinstance(referer_list, list) else referer_list
@@ -109,21 +108,22 @@ def download_asset(session, url, referer_list, indent="    ", parent_type="Asset
     local_path = os.path.join(ASSET_PATH, filename)
     relative_path = f"{ASSET_DIR_NAME}/{filename}"
 
-    if os.path.exists(local_path):
+    # 【修改】不再检查 os.path.exists，改为检查本次会话是否已处理
+    # 这样每次重启脚本都会强制覆盖硬盘上的文件
+    if filename in SESSION_DOWNLOADED:
         return relative_path, filename
 
     if not isinstance(referer_list, list):
         referer_list = [referer_list]
     referer_strategies = referer_list + [None] 
 
-    log(f"{indent}--> [下载] {full_url}")
+    log(f"--> [下载] {full_url}")
 
     for ref in referer_strategies:
         try:
             headers = {}
             if ref: headers["Referer"] = ref
             else: headers.pop("Referer", None)
-
             if "dlsite" in full_url: headers["Referer"] = "https://www.dlsite.com/"
             
             resp = session.get(full_url, headers=headers, timeout=15)
@@ -135,18 +135,21 @@ def download_asset(session, url, referer_list, indent="    ", parent_type="Asset
                         modified_content = process_css_text(session, content_str, [full_url, base_ref], tag_info="RecursiveCSS")
                         with open(local_path, 'w', encoding='utf-8') as f:
                             f.write(modified_content)
-                        log(f"{indent}    √ CSS递归完成")
+                        log(f"√ CSS递归完成: {filename}")
                     except:
                         with open(local_path, 'wb') as f:
                             f.write(resp.content)
                 else:
                     with open(local_path, 'wb') as f:
                         f.write(resp.content)
+                
+                # 标记为本次已下载
+                SESSION_DOWNLOADED.add(filename)
                 return relative_path, filename
         except:
             pass
     
-    log(f"{indent}!! [失败] {full_url}")
+    log(f"!! [失败] {full_url}")
     return None, None
 
 def process_jimdo_data(session, script_content, base_url_list):
@@ -167,8 +170,8 @@ def process_jimdo_data(session, script_content, base_url_list):
                 if isinstance(obj, dict):
                     for k, v in obj.items():
                         if k == "url" and isinstance(v, str) and v.startswith("http"):
-                            log(f"    -> [JS数据] 配置图片: {v}")
-                            _, filename = download_asset(session, v, base_url_list, indent="      ")
+                            log(f"-> [JS数据] 配置图片: {v}")
+                            _, filename = download_asset(session, v, base_url_list)
                             if filename:
                                 obj[k] = f"{ASSET_DIR_NAME}/{filename}"
                                 modified = True
@@ -183,11 +186,10 @@ def process_jimdo_data(session, script_content, base_url_list):
             if modified:
                 new_json_str = json.dumps(data, ensure_ascii=False)
                 new_script_content = script_content.replace(json_str, new_json_str)
-                log("    ★ jimdoData 已修正")
+                log("★ jimdoData 已修正")
                 return new_script_content
         except:
             pass
-    
     return script_content
 
 def download_external_css(session, url, referer):
@@ -196,14 +198,20 @@ def download_external_css(session, url, referer):
     local_path = os.path.join(ASSET_PATH, filename)
     relative_path = f"{ASSET_DIR_NAME}/{filename}"
 
+    # 外部CSS同样强制覆盖，但利用SESSION缓存避免单次运行重复请求
+    if filename in SESSION_DOWNLOADED:
+        return relative_path
+
     try:
-        log(f"  --> [外部CSS] {full_url}")
+        log(f"--> [外部CSS] {full_url}")
         resp = session.get(full_url, timeout=15)
         if resp.status_code == 200:
             content = resp.content.decode('utf-8', errors='ignore')
             modified = process_css_text(session, content, [full_url, referer], tag_info="ExternalCSS")
             with open(local_path, 'w', encoding='utf-8') as f:
                 f.write(modified)
+            
+            SESSION_DOWNLOADED.add(filename)
             return relative_path
     except:
         pass
@@ -222,13 +230,13 @@ def process_page(page, session, url, visited_urls):
     html_content = page.html
     soup = BeautifulSoup(html_content, 'html.parser')
 
-    # 1. JimdoData (背景图配置)
+    # 1. JimdoData
     for script in soup.find_all('script'):
         if script.string and "jimdoData" in script.string:
             new_content = process_jimdo_data(session, script.string, [url, START_URL])
             script.string = new_content
 
-    # 2. 内联样式 (style="...")
+    # 2. 内联样式
     for tag in soup.find_all(attrs={"style": True}):
         style_content = tag['style']
         if "url" in style_content.lower():
@@ -236,22 +244,20 @@ def process_page(page, session, url, visited_urls):
             if new_style != style_content:
                 tag['style'] = new_style
 
-    # 3. 内部样式块 (<style>)
+    # 3. 内部样式块
     for style_tag in soup.find_all('style'):
         if style_tag.string:
             new_css = process_css_text(session, style_tag.string, url, tag_info="StyleBlock")
             style_tag.string.replace_with(new_css)
 
-    # 4. Link 标签 (CSS 和 Favicon)
+    # 4. Link 标签
     for link in soup.find_all('link'):
         href = link.get('href')
         if not href: continue
-        
         rel = link.get('rel', [])
         if isinstance(rel, str): rel = [rel]
         as_attr = link.get('as', '')
         
-        # A. CSS
         is_css = "stylesheet" in rel or ("preload" in rel and as_attr == "style")
         if is_css:
             local_path = download_external_css(session, href, url)
@@ -260,32 +266,23 @@ def process_page(page, session, url, visited_urls):
                 link['rel'] = "stylesheet"
                 if link.get('as'): del link['as']
         
-        # B. Favicon 【新增】
-        # rel 可能是 ['shortcut', 'icon'] 或 ['icon']
         if any(r in rel for r in ['icon', 'shortcut']):
-            log(f"    -> 发现 Favicon: {href}")
             path, _ = download_asset(session, href, url)
-            if path: 
-                link['href'] = path
-                log(f"       ★ Favicon 已本地化")
+            if path: link['href'] = path
 
-    # 5. Meta 标签 (OG Image, Secure URL)
+    # 5. Meta 标签
     target_props = ["og:image", "og:image:secure_url"]
     target_names = ["twitter:image"]
-    
     for meta in soup.find_all('meta'):
         content = meta.get('content')
         if not content: continue
-        
         prop = meta.get('property')
         name = meta.get('name')
-        
         if prop in target_props or name in target_names:
-            log(f"    -> Meta图片: {prop or name}")
             path, _ = download_asset(session, content, url)
             if path: meta['content'] = path
 
-    # 6. 常规清理 (Script/IMG/JS)
+    # 6. 常规清理
     for script in soup.find_all('script'):
         if script.string and ("loadCss" in script.string or "onloadCSS" in script.string):
             script.decompose()
@@ -304,12 +301,14 @@ def process_page(page, session, url, visited_urls):
                 if img.get('srcset'): del img['srcset']
                 if img.get('data-src'): del img['data-src']
 
-    # 7. 链接本地化
+    # 7. 链接本地化 (含锚点修复)
     new_urls = []
     domain = urlparse(START_URL).netloc
+    
     for a in soup.find_all('a'):
         href = a.get('href')
         if not href: continue
+        
         full_href = urljoin(url, href)
         parsed = urlparse(full_href)
         
@@ -317,10 +316,20 @@ def process_page(page, session, url, visited_urls):
             if any(ext in parsed.path.lower() for ext in ['.jpg', '.zip', '.pdf', '.png']): continue 
             if any(k in parsed.path.lower() for k in ['/login', 'auth', 'cart']): continue
             
-            clean = full_href.split('#')[0].split('?')[0]
-            a['href'] = clean_page_filename(clean)
-            if clean not in visited_urls:
-                new_urls.append(clean)
+            # 提取锚点
+            fragment = parsed.fragment
+            clean_url_no_hash = full_href.split('#')[0].split('?')[0]
+            local_filename = clean_page_filename(clean_url_no_hash)
+            
+            # 拼接本地文件名 + 锚点
+            if fragment:
+                a['href'] = f"{local_filename}#{fragment}"
+            else:
+                a['href'] = local_filename
+            
+            # 入队去重
+            if clean_url_no_hash not in visited_urls:
+                new_urls.append(clean_url_no_hash)
         else:
             a['target'] = "_blank"
 
@@ -370,3 +379,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
